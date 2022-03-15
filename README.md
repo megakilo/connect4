@@ -3,6 +3,8 @@ The classic board game "connect 4" in Haskell.
 
 Inspired by the coursework of [AFP](https://www.youtube.com/watch?v=IoCINPnt0us&list=PLF1Z-APd9zK5uFc8FKr_di9bfsYv8-lbc&index=5) class.
 
+Human vs Computer using minmax game tree.
+
 ```
 -----------------------------
 | O | O |   |   |   |   |   |

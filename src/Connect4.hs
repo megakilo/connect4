@@ -1,26 +1,36 @@
-module Connect4 (startGame) where
+{-# LANGUAGE RecordWildCards #-}
 
+module Connect4 (startGame, GameConfig (..)) where
+
+import Control.DeepSeq (NFData (rnf))
 import Control.Monad (guard)
 import Control.Monad.IO.Class (MonadIO (liftIO))
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Reader (ReaderT (runReaderT), ask)
 import Control.Monad.Trans.State (StateT (StateT, runStateT), get, put)
+import Control.Parallel.Strategies (Eval, parList, rdeepseq, rpar, using)
 import Data.Char (isDigit)
 import Data.List (isInfixOf, transpose)
-import System.IO (BufferMode (NoBuffering), hSetBuffering, stdout)
 import System.Process (system)
 
 -- Grid state and current player
 type GameState = (Grid, Player)
+
+data GameConfig = GameConfig {parallelMode :: Bool, benchMode :: Bool, gameTreeDepth :: Int}
+
+type GameM = StateT GameState (ReaderT GameConfig IO) ()
 
 -- Game configs --
 gridWidth = 7
 
 gridHeight = 6
 
-gameTreeDepth = 5
-
 -- Types --
 data Player = O | B | X
   deriving (Eq, Ord)
+
+instance NFData Player where
+  rnf x = x `seq` ()
 
 instance Show Player where
   show O = " O "
@@ -34,20 +44,30 @@ type Matrix a = [Column a]
 type Grid = Matrix Player
 
 -- Game --
-startGame :: IO ()
-startGame = do
-  hSetBuffering stdout NoBuffering
-  runStateT playGame (newGrid, O)
+startGame :: GameConfig -> IO ()
+startGame config@GameConfig {..} = do
+  let f = if benchMode then benchGame else playGame
+  runReaderT (runStateT f (newGrid, O)) config
   return ()
 
-playGame :: StateT GameState IO ()
+benchGame :: GameM
+benchGame = do
+  config <- lift ask
+  game@(grid, _) <- get
+  liftIO $ putStrLn "Computer is thinking... "
+  put $! bestmove config game
+  (g, _) <- get
+  liftIO $ putGrid g
+
+playGame :: GameM
 playGame = do
+  config@GameConfig {..} <- lift ask
   game@(grid, _) <- get
   liftIO $ system "clear"
   liftIO $ putGrid grid
-  makeMove game
+  makeMove config game
   where
-    makeMove game@(grid, player)
+    makeMove config game@(grid, player)
       | wins O grid = liftIO $ putStrLn "You win!"
       | wins X grid = liftIO $ putStrLn "Computer wins!"
       | player == O = do
@@ -56,7 +76,7 @@ playGame = do
         playGame
       | otherwise = do
         liftIO $ putStrLn "Computer is thinking... "
-        put $! bestmove game
+        put $! bestmove config game
         playGame
 
 getUserInput :: Grid -> IO Int
@@ -131,7 +151,9 @@ interleave x (y : ys) = x : y : interleave x ys
 
 -- Minmax --
 data Tree a = Node a [Tree a]
-  deriving (Show)
+
+instance NFData a => NFData (Tree a) where
+  rnf (Node x ts) = rnf x `seq` rnf ts
 
 moves :: GameState -> [GameState]
 moves game@(grid, _)
@@ -146,20 +168,23 @@ prune :: Int -> Tree a -> Tree a
 prune 0 (Node x _) = Node x []
 prune n (Node x ts) = Node x [prune (n -1) t | t <- ts]
 
-minimax :: Tree GameState -> Tree (GameState, Player)
-minimax (Node game@(grid, player) [])
+minimax :: Bool -> Tree GameState -> Tree (GameState, Player)
+minimax _ (Node game@(grid, player) [])
   | wins O grid = Node (game, O) []
   | wins X grid = Node (game, X) []
   | otherwise = Node (game, B) []
-minimax (Node game@(grid, player) ts)
+minimax par (Node game@(grid, player) ts)
   | player == O = Node (game, minimum ps) ts'
   | otherwise = Node (game, maximum ps) ts'
   where
-    ts' = map minimax ts
+    ts' =
+      if par
+        then map (minimax par) ts `using` parList rdeepseq
+        else map (minimax par) ts
     ps = [p | Node (_, p) _ <- ts']
 
-bestmove :: GameState -> GameState
-bestmove gs = head [g' | Node (g', p') _ <- ts, p' == best]
+bestmove :: GameConfig -> GameState -> GameState
+bestmove GameConfig {..} gs = head [g' | Node (g', p') _ <- ts, p' == best]
   where
     tree = prune gameTreeDepth (gametree gs)
-    Node (_, best) ts = minimax tree
+    Node (_, best) ts = minimax parallelMode tree

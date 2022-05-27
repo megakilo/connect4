@@ -1,10 +1,11 @@
 {-# LANGUAGE RecordWildCards #-}
 
-module Connect4 (startGame, GameConfig (..)) where
+module Connect4 (startGame, GameConfig (..), ParallelMode (..)) where
 
 import Control.DeepSeq (NFData (rnf))
 import Control.Monad (guard)
 import Control.Monad.IO.Class (MonadIO (liftIO))
+import Control.Monad.Par (Par, parMapM, runPar)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (ReaderT (runReaderT), ask)
 import Control.Monad.Trans.State (StateT (StateT, runStateT), get, put)
@@ -16,7 +17,13 @@ import System.Process (system)
 -- Grid state and current player
 type GameState = (Grid, Player)
 
-data GameConfig = GameConfig {parallelMode :: Bool, benchMode :: Bool, gameTreeDepth :: Int}
+data ParallelMode = Seq | Par | Eval deriving (Eq)
+
+data GameConfig = GameConfig
+  { parallelMode :: ParallelMode,
+    benchMode :: Bool,
+    gameTreeDepth :: Int
+  }
 
 type GameM = StateT GameState (ReaderT GameConfig IO) ()
 
@@ -168,23 +175,36 @@ prune :: Int -> Tree a -> Tree a
 prune 0 (Node x _) = Node x []
 prune n (Node x ts) = Node x [prune (n -1) t | t <- ts]
 
-minimax :: Bool -> Tree GameState -> Tree (GameState, Player)
+minimax :: ParallelMode -> Tree GameState -> Tree (GameState, Player)
 minimax _ (Node game@(grid, player) [])
   | wins O grid = Node (game, O) []
   | wins X grid = Node (game, X) []
   | otherwise = Node (game, B) []
-minimax par (Node game@(grid, player) ts)
-  | player == O = Node (game, minimum ps) ts'
-  | otherwise = Node (game, maximum ps) ts'
+minimax par (Node game@(grid, player) ts) = Node (game, cmp ps) ts'
   where
+    cmp = if player == O then minimum else maximum
     ts' =
-      if par
+      if par == Eval
         then map (minimax par) ts `using` parList rdeepseq
         else map (minimax par) ts
     ps = [p | Node (_, p) _ <- ts']
+
+minimaxPar :: Tree GameState -> Par (Tree (GameState, Player))
+minimaxPar (Node game@(grid, player) [])
+  | wins O grid = return $ Node (game, O) []
+  | wins X grid = return $ Node (game, X) []
+  | otherwise = return $ Node (game, B) []
+minimaxPar (Node game@(grid, player) ts) = do
+  ts' <- parMapM minimaxPar ts
+  let ps = [p | Node (_, p) _ <- ts']
+  let cmp = if player == O then minimum else maximum
+  return $ Node (game, cmp ps) ts'
 
 bestmove :: GameConfig -> GameState -> GameState
 bestmove GameConfig {..} gs = head [g' | Node (g', p') _ <- ts, p' == best]
   where
     tree = prune gameTreeDepth (gametree gs)
-    Node (_, best) ts = minimax parallelMode tree
+    Node (_, best) ts =
+      if parallelMode == Par
+        then runPar $ minimaxPar tree
+        else minimax parallelMode tree
